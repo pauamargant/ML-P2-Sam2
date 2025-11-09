@@ -61,3 +61,6 @@ __pycache__/
 
 # MacOS related files
 *.DS_Store
+
+# Data folders
+samples/

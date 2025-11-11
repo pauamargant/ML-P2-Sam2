@@ -345,3 +345,14 @@ This project has been modeled on the following repositories. Their work is grate
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+## MIQUEL
+
+Run container
+
+docker run --rm -it -v "$PWD":/workspace sam2-export
+
+Run demo outside container
+
+source ./.demoenv/bin/activate
+python python/onnx_test_video.py --prompt seed_points --model_size base_plus

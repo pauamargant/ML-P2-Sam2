@@ -61,3 +61,10 @@ __pycache__/
 
 # MacOS related files
 *.DS_Store
+
+# MIQUEL
+*env 
+*Dockerfile
+*.txt
+
+

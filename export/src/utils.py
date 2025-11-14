@@ -22,11 +22,11 @@ def export_image_encoder(model, outdir, name: str | None = None) -> None:
     Image encoder export.
 
     Outputs:
-      0: image_embeddings      [1, 256, 64, 64]
-      1: high_res_features1    [1, 32, 256, 256]
-      2: high_res_features2    [1, 64, 128, 128]
-      3: current_vision_feat   [1, 256, 64, 64]
-      4: vision_pos_embed      [4096, 1, 256]
+      0: image_embeddings      [1, 256, 64, 64] Pixel features for the decoder
+      1: high_res_features1    [1, 32, 256, 256] High resolution feature (for the decoder to remember original frame)
+      2: high_res_features2    [1, 64, 128, 128] Another high resolution feature (for the decoder to remember original frame)
+      3: current_vision_feat   [1, 256, 64, 64] Pixel features prefered to the memory attention
+      4: vision_pos_embed      [4096, 1, 256] Positional eencodings for the current_vision_feat
     """
     os.makedirs(outdir, exist_ok=True)
     encoder_path = os.path.join(outdir, "image_encoder.onnx")
@@ -59,11 +59,11 @@ def export_image_decoder(model, outdir, name: str | None = None) -> None:
     Image decoder export (points/bbox prompt).
 
     Inputs:
-      point_coords      [Nlabels, Npts, 2]   (dynamic Nlabels, Npts)
-      point_labels      [Nlabels, Npts]      (dynamic Nlabels, Npts)
-      image_embed       [1, 256, 64, 64]
-      high_res_feats_0  [1, 32, 256, 256]
-      high_res_feats_1  [1, 64, 128, 128]
+      point_coords      [Nlabels, Npts, 2]   (dynamic Nlabels, Npts) Encoded prompt points coordinates
+      point_labels      [Nlabels, Npts]      (dynamic Nlabels, Npts) Encoded prompt labels
+      image_embed       [1, 256, 64, 64]  Fused image embedding 
+      high_res_feats_0  [1, 32, 256, 256] Low-level image features
+      high_res_feats_1  [1, 64, 128, 128] Low-level image features 2
 
     Outputs:
       obj_ptr
@@ -125,7 +125,7 @@ def export_memory_attention(model, outdir, name: str | None = None) -> None:
       memory_pos_embed         [buff_size, 1, 64]      (dynamic axis 0)
 
     Output:
-      fused_feat               [1, 256, 64, 64]
+      fused_feat               [1, 256, 64, 64] 
     """
     os.makedirs(outdir, exist_ok=True)
     attn_path = os.path.join(outdir, "memory_attention.onnx")

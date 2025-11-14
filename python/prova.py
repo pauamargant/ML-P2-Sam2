@@ -295,6 +295,7 @@ def process_video(args: argparse.Namespace) -> None:
     mem_feats_list = []   # list of per-frame memory features from memory_encoder
     mem_pos_list   = []   # list of per-frame memory positional embeddings
     mem_obj_list = []     # list of per-frame memory object embeddings
+    mem_obj_pos_list = []
 
 
     # Cache encoder I/O names for faster sess_enc.run(...) calls.
@@ -336,26 +337,44 @@ def process_video(args: argparse.Namespace) -> None:
             vis_pos   = enc["vision_pos_embed"].astype(np.float32, copy=False)   # needed by memory attention
             enc_ms = (time.time() - t_enc) * 1000.0
 
-        # ------------------- 6b) MEMORY ATTENTION -------------------
 
+        # ------------------- 6b) MEMORY ATTENTION -------------------
         if fidx > 0 and len(mem_feats_list) > 0:
             t_mat = time.time()
-            mem_feats_cat, mem_pos_cat = _stack_memory(mem_feats_list, mem_pos_list)
-            # note: This demo passes memory_0 (per-object tokens) as an empty array,
-            #       so only spatial ("memory_1") memory is used.
+
+            # Stack spatial memory across frames
+            mem_feats_cat, mem_pos_spatial = _stack_memory(mem_feats_list, mem_pos_list)
+            # mem_feats_cat:   [n_frames, 64, 64, 64]   -> memory_1
+            # mem_pos_spatial: [n_frames * 4096, 1, 64] -> first part of memory_pos_embed
+
+            # Stack object tokens (memory_0) and their positional encodings
+            if len(mem_obj_list) > 0:
+                mem_obj_cat     = np.concatenate(mem_obj_list, axis=0).astype(np.float32, copy=False)
+                mem_obj_pos_cat = np.concatenate(mem_obj_pos_list, axis=0).astype(np.float32, copy=False)
+                # mem_obj_cat:     [total_obj_ptrs, 256]   -> memory_0
+                # mem_obj_pos_cat: [total_obj_ptrs*4, 1, 64]
+                mem_pos_cat = np.concatenate([mem_pos_spatial, mem_obj_pos_cat], axis=0)
+                # mem_pos_cat: [n_frames*4096 + total_obj_ptrs*4, 1, 64]
+            else:
+                # No object tokens yet → only spatial memory
+                mem_obj_cat = np.zeros((0, 256), np.float32)
+                mem_pos_cat = mem_pos_spatial
+
             attn_inputs = {
                 "current_vision_feat":      enc_embed.astype(np.float32, copy=False),
                 "current_vision_pos_embed": vis_pos.astype(np.float32, copy=False),
-                "memory_0":                 np.zeros((0, 256), np.float32),  # unchanged: no per-object tokens yet
+                "memory_0":                 mem_obj_cat,
                 "memory_1":                 mem_feats_cat.astype(np.float32, copy=False),
-                "memory_pos_embed":         mem_pos_cat.astype(np.float32, copy=False),
+                "memory_pos_embed":         mem_pos_cat,
             }
+
             # fused_embed has the same spatial resolution as enc_embed but enriched with memory.
             fused_embed = sess_mat.run(None, attn_inputs)[0].astype(np.float32, copy=False)
             mat_ms = (time.time() - t_mat) * 1000.0
         else:
             fused_embed = enc_embed
             mat_ms = 0.0
+
 
         # ------------------------ 6c) DECODER ------------------------
         # Predict mask logits. On the first frame, include the user prompt tensors.
@@ -370,7 +389,23 @@ def process_video(args: argparse.Namespace) -> None:
         dec_ms = (time.time() - t_dec) * 1000.0
 
         print("obj_ptr: ", obj_ptr.shape)
+                # Normalize obj_ptr to shape [num_obj_ptrs, 256]
+        if obj_ptr is not None:
+            obj_ptr_np = np.asarray(obj_ptr, dtype=np.float32)
+            if obj_ptr_np.ndim == 3:
+                # e.g. [1, num_masks, 256] -> [num_masks, 256]
+                obj_ptr_np = obj_ptr_np.reshape(-1, obj_ptr_np.shape[-1])
+            elif obj_ptr_np.ndim == 2:
+                # already [num_masks, 256]
+                pass
+            else:
+                raise RuntimeError(f"Unexpected obj_ptr shape: {obj_ptr_np.shape}")
+        else:
+            obj_ptr_np = np.zeros((0, 256), np.float32)
 
+
+        # --------------------- 6d) MEMORY ENCODER ---------------------
+        # Convert current logits + pixel features into memory for next frames.
         # --------------------- 6d) MEMORY ENCODER ---------------------
         # Convert current logits + pixel features into memory for next frames.
         t_men = time.time()
@@ -381,20 +416,48 @@ def process_video(args: argparse.Namespace) -> None:
         }
         men_out = sess_men.run(None, men_inputs)
 
+        # From memory_encoder.onnx:
+        #   mem_feats_new : maskmem_features   [1, 64, 64, 64]
+        #   mem_pos_new   : maskmem_pos_enc   [4096, 1, 64]
+        #   mem_obj_new   : temporal_code     [T, 1, 1, 64]  (e.g. T=7)
         mem_feats_new, mem_pos_new, mem_obj_new = [x.astype(np.float32, copy=False) for x in men_out]
 
-        # Append new frame’s memory
+        print("temporal masmem_tpos_enc has shape: ", mem_obj_new.shape)
+
+        # --- Spatial memory (memory_1) ---
         mem_feats_list.append(mem_feats_new)
         mem_pos_list.append(mem_pos_new)
 
+        # --- Object memory (memory_0) and its positional encoding ---
+        # Use obj_ptr_np from decoder as object tokens [num_obj_ptrs, 256]
+        if obj_ptr_np.shape[0] > 0:
+            mem_obj_list.append(obj_ptr_np)
+
+            # Build positional encodings for object tokens from temporal_code
+            # mem_obj_new: [T, 1, 1, 64] -> [T, 1, 64]
+            temp_code = mem_obj_new.reshape(mem_obj_new.shape[0], 1, 64)
+
+            # Each 256-d obj token becomes 4 tokens of dim 64 inside memory_attention.
+            # So for each object pointer, we need 4 positional rows.
+            # Here we take the first 4 temporal slots for this frame.
+            if temp_code.shape[0] < 4:
+                # pad or tile if not enough rows (very unlikely with T=7)
+                reps = (4 + temp_code.shape[0] - 1) // temp_code.shape[0]
+                temp_code = np.tile(temp_code, (reps, 1, 1))
+            obj_pos_this = temp_code[:4]   # [4, 1, 64] for our single object
+            mem_obj_pos_list.append(obj_pos_this)
+
+        men_ms = (time.time() - t_men) * 1000.0
 
         # Prune to sliding window length (drop oldest if beyond mem_window)
         if len(mem_feats_list) > mem_window:
             mem_feats_list.pop(0)
             mem_pos_list.pop(0)
-            # mem_obj_list.pop(0)
+            if len(mem_obj_list) > 0:
+                mem_obj_list.pop(0)
+            if len(mem_obj_pos_list) > 0:
+                mem_obj_pos_list.pop(0)
 
-        men_ms = (time.time() - t_men) * 1000.0
 
         # -------------------- 6e) OVERLAY & WRITE --------------------
         # Convert logits to a binary mask in original resolution and write overlay.
